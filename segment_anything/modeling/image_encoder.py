@@ -163,7 +163,7 @@ class Block(nn.Module):
 
         self.window_size = window_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, window_origin: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
         # Window partition. Capture B explicitly so window_unpartition doesn't
@@ -171,13 +171,14 @@ class Block(nn.Module):
         # shape solver records that divide as a constant-batch guard
         # (see commit history for details).
         if self.window_size > 0:
+            origin = window_origin if window_origin is not None else (0, 0)
             B, H, W = x.shape[0], x.shape[1], x.shape[2]
-            x, pad_hw = window_partition(x, self.window_size)
+            x, pad_hw = window_partition(x, self.window_size, origin)
 
         x = self.attn(x)
         # Reverse window partition
         if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W), B)
+            x = window_unpartition(x, self.window_size, pad_hw, (H, W), B, origin)
 
         x = shortcut + x
         x = x + self.mlp(self.norm2(x))
@@ -258,12 +259,19 @@ class Attention(nn.Module):
         return super()._load_from_state_dict(rest, prefix, local_metadata, False, missing_keys, unexpected_keys, error_msgs)
 
 
-def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+def window_partition(
+    x: torch.Tensor, window_size: int, origin: Tuple[int, int] = (0, 0)
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
     Args:
         x (tensor): input tokens with [B, H, W, C].
         window_size (int): window size.
+        origin (tuple): (oy, ox) share of each axis's pad budget allocated to the
+            top/left instead of the bottom/right. Shifts the window-partition
+            phase relative to content WITHOUT adding pad: total padding stays
+            (window_size - dim % window_size) % window_size per axis, so the
+            window count is unchanged. Must satisfy 0 <= oy <= pad_h (resp. ox).
 
     Returns:
         windows: windows after partition with [B * num_windows, window_size, window_size, C].
@@ -273,8 +281,11 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
 
     pad_h = (window_size - H % window_size) % window_size
     pad_w = (window_size - W % window_size) % window_size
+    oy, ox = origin
+    assert 0 <= oy <= pad_h and 0 <= ox <= pad_w, \
+        f"window origin {origin} exceeds pad budget ({pad_h}, {pad_w})"
     if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+        x = F.pad(x, (0, 0, ox, pad_w - ox, oy, pad_h - oy))
     Hp, Wp = H + pad_h, W + pad_w
 
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
@@ -288,6 +299,7 @@ def window_unpartition(
     pad_hw: Tuple[int, int],
     hw: Tuple[int, int],
     B: int,
+    origin: Tuple[int, int] = (0, 0),
 ) -> torch.Tensor:
     """
     Window unpartition into original sequences and removing padding.
@@ -300,17 +312,20 @@ def window_unpartition(
             via `windows.shape[0] // (Hp * Wp // ws // ws)`, but torch.export's
             shape solver records the floor-divide as a constant-batch guard,
             blocking dynamic-batch engines. Passing B keeps the dim symbolic.
+        origin (tuple): the (oy, ox) pad split used by the matching
+            ``window_partition`` call.
 
     Returns:
         x: unpartitioned sequences with [B, H, W, C].
     """
     Hp, Wp = pad_hw
     H, W = hw
+    oy, ox = origin
     x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
-    if Hp > H or Wp > W:
-        x = x[:, :H, :W, :].contiguous()
+    if Hp > H or Wp > W or oy > 0 or ox > 0:
+        x = x[:, oy:oy + H, ox:ox + W, :].contiguous()
     return x
 
 
@@ -451,6 +466,7 @@ def _packed_block_forward(
     x_flat: torch.Tensor,
     sizes: List[Tuple[int, int]],
     offsets: List[int],
+    origins: Optional[List[Tuple[int, int]]] = None,
 ) -> torch.Tensor:
     """One Block forward over a packed sequence of per-image token grids.
 
@@ -461,23 +477,28 @@ def _packed_block_forward(
     window-size relative-position tables. Global attention runs one call per
     distinct grid size, because the decomposed relative-position bias is
     interpolated per (h, w).
+
+    ``origins``: optional per-image (oy, ox) pad splits for the window
+    partition (see ``window_partition``); the same list must be used for every
+    block of a forward so all blocks share one partition phase per image.
     """
     shortcut = x_flat
     x = blk.norm1(x_flat)
 
     if blk.window_size > 0:
         win_batches: List[torch.Tensor] = []
-        metas: List[Tuple[int, Tuple[int, int], Tuple[int, int]]] = []
-        for (h, w), offset in zip(sizes, offsets):
+        metas: List[Tuple[int, Tuple[int, int], Tuple[int, int], Tuple[int, int]]] = []
+        for i, ((h, w), offset) in enumerate(zip(sizes, offsets)):
+            origin = origins[i] if origins is not None else (0, 0)
             xi = x[offset : offset + h * w].view(1, h, w, -1)
-            wins, pad_hw = window_partition(xi, blk.window_size)
+            wins, pad_hw = window_partition(xi, blk.window_size, origin)
             win_batches.append(wins)
-            metas.append((wins.shape[0], pad_hw, (h, w)))
+            metas.append((wins.shape[0], pad_hw, (h, w), origin))
         wins_all = blk.attn(torch.cat(win_batches, dim=0))
         parts: List[torch.Tensor] = []
         woffset = 0
-        for nwin, pad_hw, hw in metas:
-            xi = window_unpartition(wins_all[woffset : woffset + nwin], blk.window_size, pad_hw, hw, 1)
+        for nwin, pad_hw, hw, origin in metas:
+            xi = window_unpartition(wins_all[woffset : woffset + nwin], blk.window_size, pad_hw, hw, 1, origin)
             parts.append(xi.reshape(-1, xi.shape[-1]))
             woffset += nwin
         x = torch.cat(parts, dim=0)
@@ -497,11 +518,32 @@ def _packed_block_forward(
     return x + blk.mlp(blk.norm2(x))
 
 
+def sample_window_origins(
+    sizes: List[Tuple[int, int]], window_size: int
+) -> List[Tuple[int, int]]:
+    """Sample a per-image window-partition phase within the existing pad budget.
+
+    For each axis the pad budget is (ws - dim % ws) % ws; the top/left share is
+    drawn uniformly from [0, budget], so total padding (and window count) is
+    unchanged — only the partition phase relative to content moves. An axis
+    whose grid is an exact multiple of ws has zero budget and stays at phase 0.
+    """
+    origins: List[Tuple[int, int]] = []
+    for h, w in sizes:
+        pad_h = (window_size - h % window_size) % window_size
+        pad_w = (window_size - w % window_size) % window_size
+        oy = int(torch.randint(0, pad_h + 1, ())) if pad_h else 0
+        ox = int(torch.randint(0, pad_w + 1, ())) if pad_w else 0
+        origins.append((oy, ox))
+    return origins
+
+
 def forward_trunk_packed(
     patch_embed: nn.Module,
     pos_embed: Optional[torch.Tensor],
     blocks: nn.ModuleList,
     images: List[torch.Tensor],
+    window_phase_jitter: bool = False,
 ) -> List[torch.Tensor]:
     """Run the ViTDet trunk (patch_embed -> abs pos -> blocks, no neck) over a
     list of variable-size images packed into one token sequence.
@@ -535,9 +577,21 @@ def forward_trunk_packed(
     for h, w in sizes:
         offsets.append(offsets[-1] + h * w)
 
+    # Window-phase jitter: one (oy, ox) pad split per image, shared by every
+    # windowed block of this forward, so the ViTDet window grid's fixed-pattern
+    # boundary artifact lands at a random phase relative to content (within the
+    # existing pad budget -- no extra windows).
+    origins: Optional[List[Tuple[int, int]]] = None
+    if window_phase_jitter:
+        win_sizes = {blk.window_size for blk in blocks if blk.window_size > 0}
+        if len(win_sizes) > 1:
+            raise ValueError(f"window_phase_jitter requires a single window size, got {sorted(win_sizes)}")
+        if win_sizes:
+            origins = sample_window_origins(sizes, next(iter(win_sizes)))
+
     x_flat = torch.cat(flat_tokens, dim=0)  # [total, C]
     for blk in blocks:
-        x_flat = _packed_block_forward(blk, x_flat, sizes, offsets)
+        x_flat = _packed_block_forward(blk, x_flat, sizes, offsets, origins)
 
     return [
         x_flat[offset : offset + h * w].view(h, w, -1)
