@@ -225,20 +225,51 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
+    # Global-attention blocks materialize the full (B*heads, N, N) attention map
+    # (the decomposed rel-pos bias is added to it, so it can't go through a fused
+    # kernel). At N = 128x128 = 16384 tokens (a 2048px NaViT image) that is
+    # 16 heads x 16384^2 = 4.3G entries: ~8.6 GB in bf16 per copy, and the
+    # bias-add + fp32 softmax + bf16 cast for `attn @ v` keep ~3 copies alive,
+    # i.e. a ~26 GB transient for ONE image. Above this many query rows the map
+    # is computed in row chunks instead (identical math -- softmax and the
+    # bias are per-row -- at 1/(N/chunk) of the peak). Images at or below the
+    # threshold (<= 1024px square) take the original single-shot path.
+    query_chunk: Optional[int] = 4096
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
+        N = H * W
         # qkv with shape (3, B, nHead, H * W, C)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        q, k, v = qkv.reshape(3, B * self.num_heads, N, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        chunk = self.query_chunk
+        if chunk is None or N <= chunk:
+            attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            if self.use_rel_pos:
+                attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+            attn = attn.softmax(dim=-1)
+            x = attn @ v
+        else:
+            if self.use_rel_pos:
+                Rh = get_rel_pos(H, H, self.rel_pos_h)
+                Rw = get_rel_pos(W, W, self.rel_pos_w)
+            kT = k.transpose(-2, -1)
+            outs = []
+            for start in range(0, N, chunk):
+                end = min(N, start + chunk)
+                q_c = q[:, start:end]
+                attn = (q_c * self.scale) @ kT
+                if self.use_rel_pos:
+                    attn = add_decomposed_rel_pos_rows(attn, q_c, Rh, Rw, (H, W), start, end)
+                attn = attn.softmax(dim=-1)
+                outs.append(attn @ v)
+                del attn
+            x = torch.cat(outs, dim=1)
+        x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
@@ -423,6 +454,50 @@ def add_decomposed_rel_pos(
     attn = (
         attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
     ).view(B, q_h * q_w, k_h * k_w)
+
+    return attn
+
+
+def add_decomposed_rel_pos_rows(
+    attn: torch.Tensor,
+    q: torch.Tensor,
+    Rh: torch.Tensor,
+    Rw: torch.Tensor,
+    size: Tuple[int, int],
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Row-chunked ``add_decomposed_rel_pos`` for square (q == k grid) attention.
+
+    Adds the decomposed rel-pos bias to the attention rows for the flattened
+    query indices ``[start, end)`` only. Same arithmetic as the full version
+    (rel_h[q, k_h] = <q, Rh[q_h, k_h]>, rel_w[q, k_w] = <q, Rw[q_w, k_w]>),
+    but indexing the per-row tables by each query's own (q_h, q_w) instead of
+    reshaping the query block to a full (q_h, q_w) grid -- a row chunk
+    generally does not cover whole grid rows.
+
+    Args:
+        attn (Tensor): (B, end - start, H * W) attention rows for the chunk.
+        q (Tensor): (B, end - start, C) the matching query rows.
+        Rh, Rw (Tensor): ``get_rel_pos(H, H, rel_pos_h)`` / ``get_rel_pos(W, W, rel_pos_w)``,
+            i.e. (H, H, C) and (W, W, C) -- computed ONCE per forward, not per chunk.
+        size (Tuple): (H, W) token grid, shared by queries and keys.
+        start, end (int): flattened query index range of this chunk.
+    """
+    H, W = size
+    qi = torch.arange(start, end, device=q.device)
+    q_h = qi // W
+    q_w = qi % W
+    # (nq, H, C) / (nq, W, C): each query row's slice of the rel-pos tables.
+    Rh_q = Rh[q_h]
+    Rw_q = Rw[q_w]
+    rel_h = torch.einsum("bqc,qkc->bqk", q, Rh_q)
+    rel_w = torch.einsum("bqc,qkc->bqk", q, Rw_q)
+
+    B, nq, _ = attn.shape
+    attn = (
+        attn.view(B, nq, H, W) + rel_h[:, :, :, None] + rel_w[:, :, None, :]
+    ).view(B, nq, H * W)
 
     return attn
 
