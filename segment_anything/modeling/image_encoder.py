@@ -236,7 +236,17 @@ class Attention(nn.Module):
     # threshold (<= 1024px square) take the original single-shot path.
     query_chunk: Optional[int] = 4096
 
+    # FlexAttention path (set per block by SAMWrapper.compile_model): the decomposed
+    # rel-pos bias becomes a score_mod over two per-call tables, rel_h (N x H) and
+    # rel_w (N x W) per head, so the kernel forms bias + score on the fly and no
+    # N x N attention map is ever materialized -- flash-class memory for the
+    # global blocks. Needs torch.compile (the eager flex_attention reference
+    # materializes the map); the compiled kernel is shared module-wide.
+    use_flex: bool = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_flex:
+            return self._forward_flex(x)
         B, H, W, _ = x.shape
         N = H * W
         # qkv with shape (3, B, nHead, H * W, C)
@@ -273,6 +283,53 @@ class Attention(nn.Module):
         x = self.proj(x)
 
         return x
+
+    def _forward_flex(self, x: torch.Tensor) -> torch.Tensor:
+        """Same math as forward(): softmax((q*scale) @ k^T + rel_h + rel_w) @ v, with the
+        bias applied inside the fused kernel. The two einsums are those of
+        add_decomposed_rel_pos (on the UNSCALED q); only their broadcast sum is N x N,
+        and that sum is what score_mod forms per score. All shape dependence lives in
+        captured tensors (the tables and the kv_idx -> (kh, kw) index vectors), so one
+        dynamic-shape compile covers every grid."""
+        B, H, W, _ = x.shape
+        N = H * W
+        nH = self.num_heads
+        # (B, N, 3, nH, hd) -> (3, B, nH, N, hd)
+        qkv = self.qkv(x).reshape(B, N, 3, nH, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        score_mod = None
+        if self.use_rel_pos:
+            Rh = get_rel_pos(H, H, self.rel_pos_h)  # (H, H, hd)
+            Rw = get_rel_pos(W, W, self.rel_pos_w)  # (W, W, hd)
+            r_q = q.reshape(B, nH, H, W, -1)
+            # .contiguous(): a size-1 grid dim can leave einsum output with odd strides,
+            # and Dynamo guards the captured tables' strides -> a spurious recompile.
+            rel_h = torch.einsum("bnhwc,hkc->bnhwk", r_q, Rh).reshape(B, nH, N, H).contiguous()
+            rel_w = torch.einsum("bnhwc,wkc->bnhwk", r_q, Rw).reshape(B, nH, N, W).contiguous()
+            kv_h = torch.arange(N, device=x.device) // W
+            kv_w = torch.arange(N, device=x.device) % W
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                return score + rel_h[b, h, q_idx, kv_h[kv_idx]] + rel_w[b, h, q_idx, kv_w[kv_idx]]
+
+        out = _flex_attention_compiled()(q, k, v, score_mod=score_mod, scale=self.scale)
+        x = out.permute(0, 2, 1, 3).reshape(B, H, W, -1)
+        return self.proj(x)
+
+
+_FLEX_ATTENTION = None
+
+
+def _flex_attention_compiled():
+    """torch.nn.attention.flex_attention compiled once, dynamic shapes, shared by every
+    Attention instance (the score_mod closure changes per call; its captured tensors
+    are graph inputs)."""
+    global _FLEX_ATTENTION
+    if _FLEX_ATTENTION is None:
+        from torch.nn.attention.flex_attention import flex_attention
+        _FLEX_ATTENTION = torch.compile(flex_attention, dynamic=True)
+    return _FLEX_ATTENTION
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         rest = dict()
